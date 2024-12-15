@@ -22,6 +22,9 @@ import {
 	McpServer,
 	McpTool,
 	McpToolCallResponse,
+	McpMessageType,
+	McpToolCallContent,
+	McpResourceContent,
 } from "../../shared/mcp"
 import { fileExistsAtPath } from "../../utils/fs"
 import { arePathsEqual } from "../../utils/path"
@@ -43,6 +46,11 @@ const McpSettingsSchema = z.object({
 	mcpServers: z.record(StdioConfigSchema),
 })
 
+type ValidationResult = {
+	message: string
+	messageType: McpMessageType
+} | null
+
 export class McpHub {
 	private providerRef: WeakRef<ClineProvider>
 	private disposables: vscode.Disposable[] = []
@@ -55,6 +63,100 @@ export class McpHub {
 		this.providerRef = new WeakRef(provider)
 		this.watchMcpSettingsFile()
 		this.initializeMcpServers()
+	}
+
+	private resolveVSCodeVariables(value: string): string {
+		if (!value.includes("${")) return value
+
+		const workspaceFolders = vscode.workspace.workspaceFolders
+
+		if (!workspaceFolders || workspaceFolders.length === 0) {
+			return value
+		}
+
+		value = value.replace(/\${workspaceFolder\}/g, workspaceFolders[0].uri.fsPath)
+
+		value = value.replace(/\${workspaceFolder:([^}]+)}/g, (match, name) => {
+			const folder = workspaceFolders.find(f => f.name === name)
+			if (!folder) {
+				return match
+			}
+			return folder.uri.fsPath
+		})
+
+		value = value.replace(/\${workspaceFolder\.(\d+)}/g, (match, index) => {
+			const idx = parseInt(index, 10)
+			if (idx >= 0 && idx < workspaceFolders.length) {
+				return workspaceFolders[idx].uri.fsPath
+			}
+			return match
+		})
+
+		return value
+	}
+
+	private resolveConfigVariables(config: StdioServerParameters): StdioServerParameters {
+		const resolvedConfig = { ...config }
+		
+		resolvedConfig.command = this.resolveVSCodeVariables(config.command)
+		
+		if (config.args) {
+			resolvedConfig.args = config.args.map(arg => this.resolveVSCodeVariables(arg))
+		}
+		
+		if (config.env) {
+			resolvedConfig.env = Object.fromEntries(
+				Object.entries(config.env).map(([key, value]) => [
+					key,
+					typeof value === 'string' ? this.resolveVSCodeVariables(value) : value
+				])
+			)
+		}
+		
+		return resolvedConfig
+	}
+
+	private validateResolvedConfig(name: string, config: StdioServerParameters): ValidationResult {
+		const workspaceFolders = vscode.workspace.workspaceFolders
+
+		const configStr = JSON.stringify(config)
+		if (configStr.includes("${workspaceFolder")) {
+			if (!workspaceFolders || workspaceFolders.length === 0) {
+				return {
+					message: "No workspace folder is open. Please open a workspace folder to use workspace-relative paths.",
+					messageType: "warning"
+				}
+			}
+			
+			const unresolved = configStr.match(/\${workspaceFolder:([^}]+)}/g)
+			if (unresolved) {
+				const missingFolders = unresolved.map(match => {
+					const name = match.match(/\${workspaceFolder:([^}]+)}/)?.[1]
+					return name
+				}).filter(Boolean)
+				return {
+					message: `Could not resolve workspace folder(s): ${missingFolders.join(", ")}`,
+					messageType: "error"
+				}
+			}
+
+			const unresolvedIndexed = configStr.match(/\${workspaceFolder\.(\d+)}/g)
+			if (unresolvedIndexed) {
+				const indices = unresolvedIndexed.map(match => {
+					const idx = match.match(/\${workspaceFolder\.(\d+)}/)?.[1]
+					return parseInt(idx!, 10)
+				})
+				const maxIndex = Math.max(...indices)
+				if (maxIndex >= workspaceFolders.length) {
+					return {
+						message: `Workspace folder index ${maxIndex} is out of bounds. Only ${workspaceFolders.length} folder(s) are open.`,
+						messageType: "error"
+					}
+				}
+			}
+		}
+
+		return null
 	}
 
 	getServers(): McpServer[] {
@@ -137,11 +239,35 @@ export class McpHub {
 	}
 
 	private async connectToServer(name: string, config: StdioServerParameters): Promise<void> {
-		// Remove existing connection if it exists (should never happen, the connection should be deleted beforehand)
+		const resolvedConfig = this.resolveConfigVariables(config)
+		
+		const validationResult = this.validateResolvedConfig(name, resolvedConfig)
+		if (validationResult) {
+			const connection: McpConnection = {
+				server: {
+					name,
+					config: JSON.stringify(config),
+					status: "disconnected",
+					error: validationResult.message,
+					messageType: validationResult.messageType
+				},
+				client: new Client(
+					{ name: "Cline", version: "1.0.0" },
+					{ capabilities: {} }
+				),
+				transport: new StdioClientTransport({
+					command: "echo",
+					args: ["Placeholder transport - server disabled due to configuration error"],
+				}),
+			}
+			this.connections = this.connections.filter((conn) => conn.server.name !== name)
+			this.connections.push(connection)
+			return
+		}
+		
 		this.connections = this.connections.filter((conn) => conn.server.name !== name)
 
 		try {
-			// Each MCP server requires its own transport connection and has unique capabilities, configurations, and error handling. Having separate clients also allows proper scoping of resources/tools and independent server management like reconnection.
 			const client = new Client(
 				{
 					name: "Cline",
@@ -153,14 +279,13 @@ export class McpHub {
 			)
 
 			const transport = new StdioClientTransport({
-				command: config.command,
-				args: config.args,
+				command: resolvedConfig.command,
+				args: resolvedConfig.args,
 				env: {
-					...config.env,
+					...resolvedConfig.env,
 					...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-					// ...(process.env.NODE_PATH ? { NODE_PATH: process.env.NODE_PATH } : {}),
 				},
-				stderr: "pipe", // necessary for stderr to be available
+				stderr: "pipe",
 			})
 
 			transport.onerror = async (error) => {
@@ -168,7 +293,8 @@ export class McpHub {
 				const connection = this.connections.find((conn) => conn.server.name === name)
 				if (connection) {
 					connection.server.status = "disconnected"
-					this.appendErrorMessage(connection, error.message)
+					connection.server.error = error.message
+					connection.server.messageType = "error"
 				}
 				await this.notifyWebviewOfServerChanges()
 			}
@@ -181,8 +307,7 @@ export class McpHub {
 				await this.notifyWebviewOfServerChanges()
 			}
 
-			// If the config is invalid, show an error
-			if (!StdioConfigSchema.safeParse(config).success) {
+			if (!StdioConfigSchema.safeParse(resolvedConfig).success) {
 				console.error(`Invalid config for "${name}": missing or invalid parameters`)
 				const connection: McpConnection = {
 					server: {
@@ -190,6 +315,7 @@ export class McpHub {
 						config: JSON.stringify(config),
 						status: "disconnected",
 						error: "Invalid config: missing or invalid parameters",
+						messageType: "error"
 					},
 					client,
 					transport,
@@ -198,7 +324,6 @@ export class McpHub {
 				return
 			}
 
-			// valid schema
 			const connection: McpConnection = {
 				server: {
 					name,
@@ -210,8 +335,6 @@ export class McpHub {
 			}
 			this.connections.push(connection)
 
-			// transport.stderr is only available after the process has been started. However we can't start it separately from the .connect() call because it also starts the transport. And we can't place this after the connect call since we need to capture the stderr stream before the connection is established, in order to capture errors during the connection process.
-			// As a workaround, we start the transport ourselves, and then monkey-patch the start method to no-op so that .connect() doesn't try to start it again.
 			await transport.start()
 			const stderrStream = transport.stderr
 			if (stderrStream) {
@@ -220,9 +343,8 @@ export class McpHub {
 					console.error(`Server "${name}" stderr:`, errorOutput)
 					const connection = this.connections.find((conn) => conn.server.name === name)
 					if (connection) {
-						// NOTE: we do not set server status to "disconnected" because stderr logs do not necessarily mean the server crashed or disconnected, it could just be informational. In fact when the server first starts up, it immediately logs "<name> server running on stdio" to stderr.
-						this.appendErrorMessage(connection, errorOutput)
-						// Only need to update webview right away if it's already disconnected
+						connection.server.error = errorOutput
+						connection.server.messageType = "error"
 						if (connection.server.status === "disconnected") {
 							await this.notifyWebviewOfServerChanges()
 						}
@@ -231,45 +353,28 @@ export class McpHub {
 			} else {
 				console.error(`No stderr stream for ${name}`)
 			}
-			transport.start = async () => {} // No-op now, .connect() won't fail
+			transport.start = async () => {}
 
-			// // Set up notification handlers
-			// client.setNotificationHandler(
-			// 	// @ts-ignore-next-line
-			// 	{ method: "notifications/tools/list_changed" },
-			// 	async () => {
-			// 		console.log(`Tools changed for server: ${name}`)
-			// 		connection.server.tools = await this.fetchTools(name)
-			// 		await this.notifyWebviewOfServerChanges()
-			// 	},
-			// )
-
-			// client.setNotificationHandler(
-			// 	// @ts-ignore-next-line
-			// 	{ method: "notifications/resources/list_changed" },
-			// 	async () => {
-			// 		console.log(`Resources changed for server: ${name}`)
-			// 		connection.server.resources = await this.fetchResources(name)
-			// 		connection.server.resourceTemplates = await this.fetchResourceTemplates(name)
-			// 		await this.notifyWebviewOfServerChanges()
-			// 	},
-			// )
-
-			// Connect
 			await client.connect(transport)
 			connection.server.status = "connected"
-			connection.server.error = ""
+			connection.server.error = undefined
+			connection.server.messageType = undefined
 
-			// Initial fetch of tools and resources
-			connection.server.tools = await this.fetchToolsList(name)
+			const toolsResponse = await this.fetchToolsList(name)
+			connection.server.tools = toolsResponse.map(tool => ({
+				name: tool.name,
+				description: tool.description,
+				inputSchema: tool.inputSchema as any
+			}))
+			
 			connection.server.resources = await this.fetchResourcesList(name)
 			connection.server.resourceTemplates = await this.fetchResourceTemplatesList(name)
 		} catch (error) {
-			// Update status with error
 			const connection = this.connections.find((conn) => conn.server.name === name)
 			if (connection) {
 				connection.server.status = "disconnected"
-				this.appendErrorMessage(connection, error instanceof Error ? error.message : String(error))
+				connection.server.error = error instanceof Error ? error.message : String(error)
+				connection.server.messageType = "error"
 			}
 			throw error
 		}
@@ -277,7 +382,8 @@ export class McpHub {
 
 	private appendErrorMessage(connection: McpConnection, error: string) {
 		const newError = connection.server.error ? `${connection.server.error}\n${error}` : error
-		connection.server.error = newError //.slice(0, 800)
+		connection.server.error = newError
+		connection.server.messageType = "error"
 	}
 
 	private async fetchToolsList(serverName: string): Promise<McpTool[]> {
@@ -287,7 +393,6 @@ export class McpHub {
 				?.client.request({ method: "tools/list" }, ListToolsResultSchema)
 			return response?.tools || []
 		} catch (error) {
-			// console.error(`Failed to fetch tools for ${serverName}:`, error)
 			return []
 		}
 	}
@@ -299,7 +404,6 @@ export class McpHub {
 				?.client.request({ method: "resources/list" }, ListResourcesResultSchema)
 			return response?.resources || []
 		} catch (error) {
-			// console.error(`Failed to fetch resources for ${serverName}:`, error)
 			return []
 		}
 	}
@@ -311,7 +415,6 @@ export class McpHub {
 				?.client.request({ method: "resources/templates/list" }, ListResourceTemplatesResultSchema)
 			return response?.resourceTemplates || []
 		} catch (error) {
-			// console.error(`Failed to fetch resource templates for ${serverName}:`, error)
 			return []
 		}
 	}
@@ -320,10 +423,6 @@ export class McpHub {
 		const connection = this.connections.find((conn) => conn.server.name === name)
 		if (connection) {
 			try {
-				// connection.client.removeNotificationHandler("notifications/tools/list_changed")
-				// connection.client.removeNotificationHandler("notifications/resources/list_changed")
-				// connection.client.removeNotificationHandler("notifications/stderr")
-				// connection.client.removeNotificationHandler("notifications/stderr")
 				await connection.transport.close()
 				await connection.client.close()
 			} catch (error) {
@@ -339,7 +438,6 @@ export class McpHub {
 		const currentNames = new Set(this.connections.map((conn) => conn.server.name))
 		const newNames = new Set(Object.keys(newServers))
 
-		// Delete removed servers
 		for (const name of currentNames) {
 			if (!newNames.has(name)) {
 				await this.deleteConnection(name)
@@ -347,22 +445,20 @@ export class McpHub {
 			}
 		}
 
-		// Update or add servers
 		for (const [name, config] of Object.entries(newServers)) {
 			const currentConnection = this.connections.find((conn) => conn.server.name === name)
+			const resolvedConfig = this.resolveConfigVariables(config)
 
 			if (!currentConnection) {
-				// New server
 				try {
-					this.setupFileWatcher(name, config)
+					this.setupFileWatcher(name, resolvedConfig)
 					await this.connectToServer(name, config)
 				} catch (error) {
 					console.error(`Failed to connect to new MCP server ${name}:`, error)
 				}
 			} else if (!deepEqual(JSON.parse(currentConnection.server.config), config)) {
-				// Existing server with changed config
 				try {
-					this.setupFileWatcher(name, config)
+					this.setupFileWatcher(name, resolvedConfig)
 					await this.deleteConnection(name)
 					await this.connectToServer(name, config)
 					console.log(`Reconnected MCP server with updated config: ${name}`)
@@ -370,7 +466,6 @@ export class McpHub {
 					console.error(`Failed to reconnect MCP server ${name}:`, error)
 				}
 			}
-			// If server exists with same config, do nothing
 		}
 		await this.notifyWebviewOfServerChanges()
 		this.isConnecting = false
@@ -379,12 +474,7 @@ export class McpHub {
 	private setupFileWatcher(name: string, config: any) {
 		const filePath = config.args?.find((arg: string) => arg.includes("build/index.js"))
 		if (filePath) {
-			// we use chokidar instead of onDidSaveTextDocument because it doesn't require the file to be open in the editor. The settings config is better suited for onDidSave since that will be manually updated by the user or Cline (and we want to detect save events, not every file change)
-			const watcher = chokidar.watch(filePath, {
-				// persistent: true,
-				// ignoreInitial: true,
-				// awaitWriteFinish: true, // This helps with atomic writes
-			})
+			const watcher = chokidar.watch(filePath, {})
 
 			watcher.on("change", () => {
 				console.log(`Detected change in ${filePath}. Restarting server ${name}...`)
@@ -407,18 +497,17 @@ export class McpHub {
 			return
 		}
 
-		// Get existing connection and update its status
 		const connection = this.connections.find((conn) => conn.server.name === serverName)
 		const config = connection?.server.config
 		if (config) {
 			vscode.window.showInformationMessage(`Restarting ${serverName} MCP server...`)
 			connection.server.status = "connecting"
-			connection.server.error = ""
+			connection.server.error = undefined
+			connection.server.messageType = undefined
 			await this.notifyWebviewOfServerChanges()
-			await delay(500) // artificial delay to show user that server is restarting
+			await delay(500)
 			try {
 				await this.deleteConnection(serverName)
-				// Try to connect again using existing config
 				await this.connectToServer(serverName, JSON.parse(config))
 				vscode.window.showInformationMessage(`${serverName} MCP server connected`)
 			} catch (error) {
@@ -432,7 +521,6 @@ export class McpHub {
 	}
 
 	private async notifyWebviewOfServerChanges(): Promise<void> {
-		// servers should always be sorted in the order they are defined in the settings file
 		const settingsPath = await this.getMcpSettingsFilePath()
 		const content = await fs.readFile(settingsPath, "utf-8")
 		const config = JSON.parse(content)
@@ -449,14 +537,12 @@ export class McpHub {
 		})
 	}
 
-	// Using server
-
 	async readResource(serverName: string, uri: string): Promise<McpResourceResponse> {
 		const connection = this.connections.find((conn) => conn.server.name === serverName)
 		if (!connection) {
 			throw new Error(`No connection found for server: ${serverName}`)
 		}
-		return await connection.client.request(
+		const response = await connection.client.request(
 			{
 				method: "resources/read",
 				params: {
@@ -465,6 +551,13 @@ export class McpHub {
 			},
 			ReadResourceResultSchema,
 		)
+		return {
+			contents: response.contents.map(content => ({
+				uri: content.uri,
+				mimeType: content.mimeType,
+				text: ('text' in content ? content.text : content.blob) as string
+			}))
+		}
 	}
 
 	async callTool(
@@ -478,7 +571,7 @@ export class McpHub {
 				`No connection found for server: ${serverName}. Please make sure to use MCP servers available under 'Connected MCP Servers'.`,
 			)
 		}
-		return await connection.client.request(
+		const response = await connection.client.request(
 			{
 				method: "tools/call",
 				params: {
@@ -488,6 +581,13 @@ export class McpHub {
 			},
 			CallToolResultSchema,
 		)
+		return {
+			content: response.content.map(content => ({
+				type: content.type,
+				text: ('text' in content ? content.text : content.data) as string
+			})),
+			isError: response.isError
+		}
 	}
 
 	async dispose(): Promise<void> {

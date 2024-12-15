@@ -18,66 +18,6 @@ type McpViewProps = {
 
 const McpView = ({ onDone }: McpViewProps) => {
 	const { mcpServers: servers } = useExtensionState()
-	// const [servers, setServers] = useState<McpServer[]>([
-	// 	// Add some mock servers for testing
-	// 	{
-	// 		name: "local-tools",
-	// 		config: JSON.stringify({
-	// 			mcpServers: {
-	// 				"local-tools": {
-	// 					command: "npx",
-	// 					args: ["-y", "@modelcontextprotocol/server-tools"],
-	// 				},
-	// 			},
-	// 		}),
-	// 		status: "connected",
-	// 		tools: [
-	// 			{
-	// 				name: "execute_command",
-	// 				description: "Run a shell command on the local system",
-	// 			},
-	// 			{
-	// 				name: "read_file",
-	// 				description: "Read contents of a file from the filesystem",
-	// 			},
-	// 		],
-	// 	},
-	// 	{
-	// 		name: "postgres-db",
-	// 		config: JSON.stringify({
-	// 			mcpServers: {
-	// 				"postgres-db": {
-	// 					command: "npx",
-	// 					args: ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"],
-	// 				},
-	// 			},
-	// 		}),
-	// 		status: "disconnected",
-	// 		error: "Failed to connect to database: Connection refused",
-	// 	},
-	// 	{
-	// 		name: "github-tools",
-	// 		config: JSON.stringify({
-	// 			mcpServers: {
-	// 				"github-tools": {
-	// 					command: "npx",
-	// 					args: ["-y", "@modelcontextprotocol/server-github"],
-	// 				},
-	// 			},
-	// 		}),
-	// 		status: "connecting",
-	// 		resources: [
-	// 			{
-	// 				uri: "github://repo/issues",
-	// 				name: "Repository Issues",
-	// 			},
-	// 			{
-	// 				uri: "github://repo/pulls",
-	// 				name: "Pull Requests",
-	// 			},
-	// 		],
-	// 	},
-	// ])
 
 	return (
 		<div
@@ -166,6 +106,16 @@ const ServerRow = ({ server }: { server: McpServer }) => {
 		}
 	}
 
+	const getMessageColor = () => {
+		switch (server.messageType) {
+			case "warning":
+				return "var(--vscode-charts-yellow)"
+			case "error":
+			default:
+				return "var(--vscode-testing-iconFailed)"
+		}
+	}
+
 	const handleRowClick = () => {
 		if (!server.error) {
 			setIsExpanded(!isExpanded)
@@ -219,7 +169,7 @@ const ServerRow = ({ server }: { server: McpServer }) => {
 					}}>
 					<div
 						style={{
-							color: "var(--vscode-testing-iconFailed)",
+							color: getMessageColor(),
 							marginBottom: "8px",
 							padding: "0 10px",
 							overflowWrap: "break-word",
